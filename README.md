@@ -1,126 +1,140 @@
 # MIDI Router
 
-An ultra-low-latency, zero-dependency macOS CoreMIDI routing daemon built natively for Apple Silicon (ARM64).
+An ultra-low-latency, zero-dependency macOS CoreMIDI routing daemon compiled natively for Apple Silicon (ARM64).
 
-Directly routes MIDI between USB devices without needing a DAW, heavy background applications, or outdated Intel-era utilities (such as MidiPipe or MIDI Patchbay).
+Directly bridges USB MIDI between hardware instruments without needing a DAW, heavy background applications, or outdated Intel-era utilities (such as MidiPipe or MIDI Patchbay).
+
+Designed specifically for headless, rock-solid studio rigs connected entirely via class-compliant USB directly into a Mac.
 
 ---
 
-## Highlights
+## Key Features
 
-- **Universal Hardware Support**: Works with **any** class-compliant USB MIDI device recognized by macOS—including grooveboxes, synthesizers, drum machines, MIDI keyboards, pad controllers, and USB-to-DIN MIDI interfaces (Elektron, Arturia, Moog, Roland, Korg, Novation, Teenage Engineering, Focusrite, etc.).
+- **Multi-Rule Routing Engine**: Route multiple hardware sources to single or multiple destinations simultaneously.
+- **Real-Time Clock & Transport Filtering**: Selectively strip System Real-Time messages (`0xF8` Clock, `0xFA` Start, `0xFB` Continue, `0xFC` Stop, `0xFE` Active Sensing) on controller routes so hardware sequencers retain master clock authority without sync conflicts.
+- **Universal Hardware Support**: Works with **any** class-compliant USB MIDI device recognized by macOS (Elektron, Arturia, Moog, Roland, Korg, Novation, Teenage Engineering, Focusrite, etc.).
 - **Zero Overhead**: Native C compiled for Apple Silicon with direct CoreMIDI buffer passing. Uses **0.0% CPU** and ~6 MB RAM.
-- **Starts on Boot**: Easily installs as a persistent macOS `launchd` service that starts automatically on login/boot and stays alive.
-- **Auto-Reconnect (Hot-Plug Resilient)**: Automatically detects when devices are powered off/on or unplugged/replugged, re-establishing the MIDI connection within milliseconds.
-- **Pure MIDI 1.0 Transparent**: Forwards all Notes, CC, Pitch Bend, Aftertouch (Channel & Polyphonic), Program Changes, Clock, Transport (Start/Stop/Continue), Song Position, and SysEx byte-for-byte.
-- **Live MIDI Monitor**: Includes a built-in real-time packet monitor to watch notes, CC, and transport events live in your terminal.
+- **Headless macOS LaunchAgent (Start on Boot)**: Runs silently in the background at login/boot with zero UI.
+- **Auto-Reconnect (Hot-Plug & Sleep Resilient)**: Endpoints are matched dynamically by string name. When devices are powered off/on, unplugged/replugged, or when the Mac wakes from sleep, connections re-establish within milliseconds.
+- **Live MIDI Activity Monitor**: Built-in real-time packet monitor to watch notes, CC, channel targeting, and transport events live in your terminal.
 
 ---
 
-## Quick Start
+## Active Studio Configuration
 
-### 1. List Available MIDI Devices
-See all inputs (sources) and outputs (destinations) currently connected to your Mac:
+By default, `midi-router` manages configuration via `~/.config/midi-router/routes.conf`:
+
+```ini
+# Rule 1: DT2 -> DN2 (Master Clock, Transport & Channel Data Bridge)
+# Digitakt II acts as master hardware brain. Clock and transport pass through.
+route Digitakt -> Digitone
+
+# Rule 2: KeyStep -> DT2 & DN2 (Controller Fan-Out for Auto Channels)
+# Broadcasts to both units with real-time clock/transport filtered out.
+# Switch channels on KeyStep:
+#   - Channel 14 -> DT2 Auto Channel (plays active sampler track)
+#   - Channel 10 -> DN2 Auto Channel (plays active synth track)
+route KeyStep -> Digitakt, Digitone filter-realtime
+```
+
+### How the Rig Operates:
+1. **Digitakt II $\rightarrow$ Digitone II**:
+   - Master MIDI Clock (`0xF8`), Transport (`0xFA` Start / `0xFC` Stop), and channel data flow from DT2 to DN2.
+   - DT2 acts as the master hardware brain and clock source.
+2. **KeyStep $\rightarrow$ DT2 & DN2 (Fan-Out & Filtering)**:
+   - When the KeyStep is connected, incoming notes, velocity, pitch bend, aftertouch, and modulation strips are broadcast to **both** units.
+   - Internal KeyStep clock and transport controls are filtered out so they never interfere with DT2's master sequencer.
+   - **Channel 14**: Targets DT2's Auto Channel (instantly plays whichever sample track is currently selected on DT2).
+   - **Channel 10**: Targets DN2's Auto Channel (instantly plays whichever synth track is currently selected on DN2).
+
+---
+
+## CLI Commands
+
+You can run `midi-router` from any terminal:
+
+### Check Status & Active Routes
+```bash
+midi-router --status
+```
+Example output:
+```text
+[STATUS] Background service 'com.stevenrobinson.midi-router' is RUNNING (PID 77952)
+Config file: /Users/stevenrobinson/.config/midi-router/routes.conf
+Log file:    /Users/stevenrobinson/Library/Logs/midi-router.log
+
+Configured Routes (2):
+  1. DT2 -> DN2:      'Digitakt' [ONLINE] -> 'Digitone' [ONLINE] (Pass-Through)
+  2. KeyStep -> Both: 'KeyStep' [WAITING] -> ['Digitakt', 'Digitone'] (Clock Filtered)
+```
+
+### Live MIDI Monitor
+Inspect incoming MIDI data in real time to verify note numbers, velocities, and Auto Channel targeting:
+```bash
+midi-router -v
+```
+*(Press `Ctrl+C` when done. The background service continues running.)*
+
+### Stream Background Logs
+```bash
+tail -f ~/Library/Logs/midi-router.log
+```
+
+### List All Connected Devices
 ```bash
 midi-router --list
 ```
 
-### 2. Route Any Devices
-Specify devices by name or partial name (case-insensitive):
+### Install / Restart Background Service
 ```bash
-# Example: Route an Arturia Keystep to a Korg Minilogue
-midi-router -s "Keystep" -d "Minilogue"
-
-# Example: Route an Elektron Digitakt II to an Elektron Digitone II
-midi-router -s "Digitakt" -d "Digitone"
-```
-*(By default, `--source "Digitakt"` and `--dest "Digitone"` are used if no flags are specified.)*
-
-### 3. Bi-directional Routing
-To route both ways simultaneously (Source $\leftrightarrow$ Destination):
-```bash
-midi-router -s "Digitakt" -d "Digitone" --bidirectional
-```
-
----
-
-## Background Service (Start on Boot)
-
-You can install `midi-router` as a native macOS background LaunchAgent with a single command. It will run silently in the background and auto-start every time your Mac boots:
-
-```bash
-# Install with defaults (Digitakt -> Digitone)
 midi-router --install
-
-# Or install with custom devices
-midi-router -s "Keystep" -d "Digitone" --install
-
-# Or install in bidirectional mode
-midi-router -s "Digitakt" -d "Digitone" --bidirectional --install
 ```
 
-### Manage the Background Service
-
-- **Check status & recent logs:**
-  ```bash
-  midi-router --status
-  ```
-- **Stream live connection logs:**
-  ```bash
-  tail -f ~/Library/Logs/midi-router.log
-  ```
-- **Uninstall / Stop the background service:**
-  ```bash
-  midi-router --uninstall
-  ```
-
----
-
-## Live MIDI Activity Monitor
-
-To inspect incoming MIDI data in real time (great for verifying whether notes, CC knobs, or clock are transmitting):
-
+### Uninstall / Stop Background Service
 ```bash
-# Monitor notes, CC, pitch bend, and transport
-midi-router -v
-
-# Full monitor including high-frequency clock ticks
-midi-router -vv
+midi-router --uninstall
 ```
-*(Press `Ctrl+C` to exit the monitor; any running background service will continue unaffected.)*
 
 ---
 
-## Example Hardware Setup: Elektron Digitakt II & Digitone II
+## Configuration Syntax (`routes.conf`)
 
-To route between an Elektron Digitakt II (transmitter/sequencer) and Digitone II (synth receiver):
+Edit `~/.config/midi-router/routes.conf` to add or modify rules:
 
-1. **USB Config** (on both machines):
-   - Navigate to `[SETTINGS] > SYSTEM > USB CONFIG`.
-   - Set to **USB MIDI**.
+```ini
+route <SourcePattern> -> <DestPattern1>, <DestPattern2>, ... [options]
+```
 
-2. **Digitakt II (Transmitter)**:
-   - Navigate to `[SETTINGS] > MIDI CONFIG > PORT CONFIG`.
-   - `OUT PORT FUNC`: Set to **MIDI** (or **MIDI+USB**).
-   - `OUTPUT TO`: Set to **USB** (or **MIDI+USB**).
-   - `CLOCK SEND`: Enable if you want Digitakt II to control the tempo of Digitone II.
-   - `TRANSPORT SEND`: Enable if you want Digitakt's Play/Stop buttons to start and stop the Digitone II sequencer.
+### Options:
+- `filter-realtime`: Strips System Real-Time messages (`0xF8` Clock, `0xFA` Start, `0xFB` Continue, `0xFC` Stop, `0xFE` Active Sensing). Essential for hardware keyboards/sequencers with internal clocks.
 
-3. **Digitone II (Receiver)**:
-   - Navigate to `[SETTINGS] > MIDI CONFIG > PORT CONFIG`.
-   - `IN PORT FUNC`: Set to **MIDI** (or **MIDI+USB**).
-   - `INPUT FROM`: Set to **USB** (or **MIDI+USB**).
-   - `CLOCK RECEIVE`: Enable to sync tempo with Digitakt.
-   - `TRANSPORT RECEIVE`: Enable to follow Digitakt Play/Stop commands.
+---
 
-4. **MIDI Channels**:
-   - In `[SETTINGS] > MIDI CONFIG > CHANNELS`, ensure your Digitakt MIDI tracks output to the corresponding MIDI channels configured on your Digitone tracks.
+## Elektron Hardware Settings Reference
+
+### Digitakt II (Master Sequencer & Clock Transmitter):
+- `[SETTINGS] > SYSTEM > USB CONFIG`: Set to **USB MIDI**.
+- `[SETTINGS] > MIDI CONFIG > PORT CONFIG`:
+  - `OUT PORT FUNC`: **MIDI** (or **MIDI+USB**)
+  - `OUTPUT TO`: **USB** (or **MIDI+USB**)
+  - `CLOCK SEND`: **Checked**
+  - `TRANSPORT SEND`: **Checked**
+- `[SETTINGS] > MIDI CONFIG > CHANNELS`:
+  - `AUTO CHANNEL`: Set to **14** (default)
+
+### Digitone II (Synth Receiver):
+- `[SETTINGS] > SYSTEM > USB CONFIG`: Set to **USB MIDI**.
+- `[SETTINGS] > MIDI CONFIG > PORT CONFIG`:
+  - `IN PORT FUNC`: **MIDI** (or **MIDI+USB**)
+  - `INPUT FROM`: **USB** (or **MIDI+USB**)
+  - `CLOCK RECEIVE`: **Checked**
+  - `TRANSPORT RECEIVE`: **Checked**
+- `[SETTINGS] > MIDI CONFIG > CHANNELS`:
+  - `AUTO CHANNEL`: Set to **10** (default)
 
 ---
 
 ## Building from Source
-
-Requirements: macOS with Apple Command Line Tools (`clang`). Zero external libraries or package managers required.
 
 ```bash
 git clone https://github.com/Steven-Robinson/midi-router.git
