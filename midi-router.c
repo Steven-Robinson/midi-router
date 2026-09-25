@@ -10,10 +10,11 @@
 #include <sys/stat.h>
 #include <ctype.h>
 #include <getopt.h>
+#include <stdatomic.h>
 #include <CoreMIDI/CoreMIDI.h>
 #include <CoreFoundation/CoreFoundation.h>
 
-#define VERSION "1.1.0"
+#define VERSION "1.2.0"
 #define SERVICE_LABEL "com.stevenrobinson.midi-router"
 #define MAX_DESTINATIONS 8
 #define MAX_RULES 16
@@ -25,13 +26,13 @@ typedef struct {
     char destPatterns[MAX_DESTINATIONS][64];
     bool filterRealtime;
 
-    // Dynamic runtime state
-    MIDIEndpointRef srcEndpoint;
+    // Dynamic runtime state (thread-safe for CoreMIDI audio threads)
+    _Atomic(MIDIEndpointRef) srcEndpoint;
     char resolvedSrcName[128];
     bool srcConnected;
 
     int numResolvedDests;
-    MIDIEndpointRef destEndpoints[MAX_DESTINATIONS];
+    _Atomic(MIDIEndpointRef) destEndpoints[MAX_DESTINATIONS];
     char resolvedDestNames[MAX_DESTINATIONS][128];
 
     MIDIPortRef inPort;
@@ -40,6 +41,7 @@ typedef struct {
 static MidiRouteRule gRules[MAX_RULES];
 static int gNumRules = 0;
 static int gVerbose = 0; // 0 = off, 1 = notes/cc/transport, 2 = all including clock
+static bool gPassiveMonitor = false; // When true, listens and displays but does NOT re-forward (prevents duplicate clock)
 static char gCustomConfigPath[512] = {0};
 
 static CFRunLoopRef gRunLoop = NULL;
@@ -225,7 +227,6 @@ static void loadConfigFile(void) {
 
         strncpy(rule->sourcePattern, srcPart, sizeof(rule->sourcePattern) - 1);
 
-        // Check for options at the end of dstPart
         char *optFilter = strstr(dstPart, "filter-realtime");
         if (optFilter) {
             rule->filterRealtime = true;
@@ -233,7 +234,6 @@ static void loadConfigFile(void) {
             dstPart = trimWhitespace(dstPart);
         }
 
-        // Parse comma-separated destinations
         char *destTok = strtok(dstPart, ",");
         while (destTok && rule->numDestPatterns < MAX_DESTINATIONS) {
             char *cleanDest = trimWhitespace(destTok);
@@ -332,45 +332,49 @@ static void logMidiMessage(const char *ruleName, const UInt8 *data, UInt16 lengt
     fflush(stdout);
 }
 
-static void filterAndForwardPacketList(MIDIPortRef outPort, MIDIEndpointRef dest, const MIDIPacketList *pktlist, bool filterRealtime) {
+static void filterAndForwardPacketList(MidiRouteRule *rule, int destIndex, MIDIPortRef outPort, MIDIEndpointRef dest, const MIDIPacketList *pktlist, bool filterRealtime) {
     if (!dest) return;
 
+    OSStatus st = noErr;
     if (!filterRealtime) {
         // Fast path: pass unaltered
-        MIDISend(outPort, dest, pktlist);
-        return;
-    }
+        st = MIDISend(outPort, dest, pktlist);
+    } else {
+        // Filter real-time messages (0xF8 - 0xFF)
+        Byte buffer[4096];
+        MIDIPacketList *filteredList = (MIDIPacketList *)buffer;
+        MIDIPacket *curPkt = MIDIPacketListInit(filteredList);
 
-    // Filter real-time messages (0xF8 - 0xFF)
-    Byte buffer[4096];
-    MIDIPacketList *filteredList = (MIDIPacketList *)buffer;
-    MIDIPacket *curPkt = MIDIPacketListInit(filteredList);
+        const MIDIPacket *pkt = &pktlist->packet[0];
+        for (UInt32 i = 0; i < pktlist->numPackets; ++i) {
+            Byte cleanData[256];
+            ByteCount cleanLen = 0;
 
-    const MIDIPacket *pkt = &pktlist->packet[0];
-    for (UInt32 i = 0; i < pktlist->numPackets; ++i) {
-        Byte cleanData[256];
-        ByteCount cleanLen = 0;
-
-        for (UInt16 b = 0; b < pkt->length && cleanLen < sizeof(cleanData); ++b) {
-            Byte byte = pkt->data[b];
-            if (byte >= 0xF8) {
-                // Filter out Real-Time Clock (0xF8), Start (0xFA), Continue (0xFB), Stop (0xFC), Active Sensing (0xFE)
-                continue;
+            for (UInt16 b = 0; b < pkt->length && cleanLen < sizeof(cleanData); ++b) {
+                Byte byte = pkt->data[b];
+                if (byte >= 0xF8) {
+                    continue;
+                }
+                cleanData[cleanLen++] = byte;
             }
-            cleanData[cleanLen++] = byte;
+
+            if (cleanLen > 0) {
+                MIDIPacket *nextPkt = MIDIPacketListAdd(filteredList, sizeof(buffer), curPkt, pkt->timeStamp, cleanLen, cleanData);
+                if (nextPkt != NULL) {
+                    curPkt = nextPkt;
+                }
+            }
+            pkt = MIDIPacketNext(pkt);
         }
 
-        if (cleanLen > 0) {
-            MIDIPacket *nextPkt = MIDIPacketListAdd(filteredList, sizeof(buffer), curPkt, pkt->timeStamp, cleanLen, cleanData);
-            if (nextPkt != NULL) {
-                curPkt = nextPkt;
-            }
+        if (filteredList->numPackets > 0) {
+            st = MIDISend(outPort, dest, filteredList);
         }
-        pkt = MIDIPacketNext(pkt);
     }
 
-    if (filteredList->numPackets > 0) {
-        MIDISend(outPort, dest, filteredList);
+    if (st != noErr) {
+        // Handle invalid/stale endpoint immediately
+        atomic_store_explicit(&rule->destEndpoints[destIndex], 0, memory_order_release);
     }
 }
 
@@ -392,46 +396,51 @@ static void updateAllRouting(void) {
             if (newDests[d] != 0) {
                 resolvedCount++;
             }
-        }
 
-        bool sourceChanged = (newSrc != rule->srcEndpoint);
+            MIDIEndpointRef oldDst = atomic_load_explicit(&rule->destEndpoints[d], memory_order_relaxed);
+            if (newDests[d] != oldDst) {
+                atomic_store_explicit(&rule->destEndpoints[d], newDests[d], memory_order_release);
+                strncpy(rule->resolvedDestNames[d], currentDstNames[d], sizeof(rule->resolvedDestNames[d]) - 1);
+
+                if (oldDst != 0 && newDests[d] == 0) {
+                    printTimestamp();
+                    printf("[DISCONNECTED] %s: destination '%s' went offline.\n", rule->name, rule->destPatterns[d]);
+                    fflush(stdout);
+                } else if (newDests[d] != 0) {
+                    printTimestamp();
+                    printf("[CONNECTED] %s: destination '%s' online ('%s')\n", rule->name, rule->destPatterns[d], currentDstNames[d]);
+                    fflush(stdout);
+                }
+            }
+        }
+        rule->numResolvedDests = resolvedCount;
+
+        MIDIEndpointRef oldSrc = atomic_load_explicit(&rule->srcEndpoint, memory_order_relaxed);
+        bool sourceChanged = (newSrc != oldSrc);
 
         // If source was connected and is now gone or changed
         if (rule->srcConnected && (sourceChanged || newSrc == 0)) {
-            if (rule->inPort && rule->srcEndpoint) {
-                MIDIPortDisconnectSource(rule->inPort, rule->srcEndpoint);
+            if (rule->inPort && oldSrc != 0) {
+                MIDIPortDisconnectSource(rule->inPort, oldSrc);
             }
             rule->srcConnected = false;
-            rule->srcEndpoint = 0;
+            atomic_store_explicit(&rule->srcEndpoint, 0, memory_order_release);
             printTimestamp();
             printf("[DISCONNECTED] %s: source '%s' went offline.\n", rule->name, rule->resolvedSrcName);
             fflush(stdout);
         }
 
-        // Update destination pointers
-        for (int d = 0; d < rule->numDestPatterns; d++) {
-            rule->destEndpoints[d] = newDests[d];
-            strncpy(rule->resolvedDestNames[d], currentDstNames[d], sizeof(rule->resolvedDestNames[d]) - 1);
-        }
-        rule->numResolvedDests = resolvedCount;
-
-        // Connect if source is present and at least one destination is available
-        if (newSrc != 0 && resolvedCount > 0) {
+        // Connect if source is present and at least one destination is available (or in passive monitor mode)
+        if (newSrc != 0 && (resolvedCount > 0 || gPassiveMonitor)) {
             if (!rule->srcConnected || sourceChanged) {
-                rule->srcEndpoint = newSrc;
+                atomic_store_explicit(&rule->srcEndpoint, newSrc, memory_order_release);
                 strncpy(rule->resolvedSrcName, currentSrcName, sizeof(rule->resolvedSrcName) - 1);
 
-                OSStatus st = MIDIPortConnectSource(rule->inPort, rule->srcEndpoint, (void *)(uintptr_t)r);
+                OSStatus st = MIDIPortConnectSource(rule->inPort, newSrc, (void *)(uintptr_t)r);
                 if (st == noErr) {
                     rule->srcConnected = true;
                     printTimestamp();
-                    printf("[CONNECTED] %s: '%s' -> [", rule->name, rule->resolvedSrcName);
-                    for (int d = 0; d < rule->numDestPatterns; d++) {
-                        if (rule->destEndpoints[d] != 0) {
-                            printf("%s'%s'", (d > 0 ? ", " : ""), rule->resolvedDestNames[d]);
-                        }
-                    }
-                    printf("]%s\n", rule->filterRealtime ? " (Real-Time Clock Filtered)" : " (Full Pass-Through)");
+                    printf("[CONNECTED] %s: source '%s' online\n", rule->name, rule->resolvedSrcName);
                     fflush(stdout);
                 } else {
                     printTimestamp();
@@ -464,8 +473,6 @@ static void notifyCallback(const MIDINotification *message, void *refCon) {
 
 static void signalHandler(int sig) {
     (void)sig;
-    printTimestamp();
-    printf("Stopping MIDI Router...\n");
     if (gRunLoop) {
         CFRunLoopStop(gRunLoop);
     }
@@ -499,14 +506,11 @@ static void listDevices(void) {
     }
 }
 
-static void printStatus(void) {
+static int getDaemonPID(void) {
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "launchctl print gui/%d/%s 2>&1", (int)getuid(), SERVICE_LABEL);
     FILE *fp = popen(cmd, "r");
-    if (!fp) {
-        printf("Failed to check launchctl status.\n");
-        return;
-    }
+    if (!fp) return 0;
     char buf[512];
     bool running = false;
     int pid = 0;
@@ -520,7 +524,14 @@ static void printStatus(void) {
         }
     }
     pclose(fp);
+    return (running && pid > 0 && pid != getpid()) ? pid : 0;
+}
 
+static void printStatus(void) {
+    MIDIClientRef client = 0;
+    MIDIClientCreate(CFSTR("StatusClient"), NULL, NULL, &client);
+
+    int pid = getDaemonPID();
     char confPath[512];
     getConfigPath(confPath, sizeof(confPath));
 
@@ -528,7 +539,7 @@ static void printStatus(void) {
     char logPath[512];
     snprintf(logPath, sizeof(logPath), "%s/Library/Logs/midi-router.log", home);
 
-    if (running) {
+    if (pid > 0) {
         printf("[STATUS] Background service '%s' is RUNNING (PID %d)\n", SERVICE_LABEL, pid);
     } else {
         printf("[STATUS] Background service '%s' is NOT running.\n", SERVICE_LABEL);
@@ -559,9 +570,12 @@ static void printStatus(void) {
 
     if (access(logPath, R_OK) == 0) {
         printf("--- Recent Log (last 6 lines) ---\n");
+        char cmd[512];
         snprintf(cmd, sizeof(cmd), "tail -n 6 '%s'", logPath);
         system(cmd);
     }
+
+    if (client) MIDIClientDispose(client);
 }
 
 static int installService(void) {
@@ -586,12 +600,10 @@ static int installService(void) {
     mkdir(plistDir, 0755);
     mkdir(logDir, 0755);
 
-    // Ensure config file exists
     if (access(confPath, R_OK) != 0) {
         writeDefaultConfigFile(confPath);
     }
 
-    // Copy executable if installing from build directory
     char currentBin[1024];
     uint32_t size = sizeof(currentBin);
     extern int _NSGetExecutablePath(char *buf, uint32_t *bufsize);
@@ -608,7 +620,6 @@ static int installService(void) {
         }
     }
 
-    // Write LaunchAgent plist
     FILE *f = fopen(plistFile, "w");
     if (!f) {
         perror("Failed to create plist file");
@@ -639,7 +650,6 @@ static int installService(void) {
 
     printf("[OK] Wrote LaunchAgent: %s\n", plistFile);
 
-    // Restart service via launchctl
     char launchCmd[1024];
     snprintf(launchCmd, sizeof(launchCmd), "launchctl bootout gui/%d/%s 2>/dev/null", (int)getuid(), SERVICE_LABEL);
     system(launchCmd);
@@ -758,17 +768,27 @@ int main(int argc, char **argv) {
     char confPath[512];
     getConfigPath(confPath, sizeof(confPath));
 
-    printTimestamp();
-    printf("Starting MIDI Router v%s (Apple Silicon Native)\n", VERSION);
-    printf("Config File: %s (%d rules configured)\n", confPath, gNumRules);
-    for (int r = 0; r < gNumRules; r++) {
-        printf("  Rule %d: '%s' -> [", r + 1, gRules[r].sourcePattern);
-        for (int d = 0; d < gRules[r].numDestPatterns; d++) {
-            printf("%s'%s'", (d > 0 ? ", " : ""), gRules[r].destPatterns[d]);
+    int daemonPid = getDaemonPID();
+    if (gVerbose > 0 && daemonPid > 0) {
+        // Background daemon is active: run in PASSIVE MONITOR mode!
+        // This prevents duplicate forwarding / double clocking!
+        gPassiveMonitor = true;
+        printTimestamp();
+        printf("Background router service is RUNNING (PID %d).\n", daemonPid);
+        printf("Entering PASSIVE MONITOR mode (zero duplicate MIDI forwarding).\n\n");
+    } else {
+        printTimestamp();
+        printf("Starting MIDI Router v%s (Apple Silicon Native)\n", VERSION);
+        printf("Config File: %s (%d rules configured)\n", confPath, gNumRules);
+        for (int r = 0; r < gNumRules; r++) {
+            printf("  Rule %d: '%s' -> [", r + 1, gRules[r].sourcePattern);
+            for (int d = 0; d < gRules[r].numDestPatterns; d++) {
+                printf("%s'%s'", (d > 0 ? ", " : ""), gRules[r].destPatterns[d]);
+            }
+            printf("]%s\n", gRules[r].filterRealtime ? " (Clock/Transport Filtered)" : " (Pass-Through)");
         }
-        printf("]%s\n", gRules[r].filterRealtime ? " (Clock/Transport Filtered)" : " (Pass-Through)");
+        printf("Verbose Monitor: %s\n", gVerbose ? (gVerbose > 1 ? "Full (with clock)" : "Yes") : "No");
     }
-    printf("Verbose Monitor: %s\n", gVerbose ? (gVerbose > 1 ? "Full (with clock)" : "Yes") : "No");
     fflush(stdout);
 
     OSStatus status = MIDIClientCreateWithBlock(CFSTR("MidiRouterClient"), &gClient, ^(const MIDINotification *message) {
@@ -779,10 +799,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    status = MIDIOutputPortCreate(gClient, CFSTR("MidiRouterOut"), &gOutPort);
-    if (status != noErr) {
-        fprintf(stderr, "Error: MIDIOutputPortCreate failed (%d)\n", (int)status);
-        return 1;
+    if (!gPassiveMonitor) {
+        status = MIDIOutputPortCreate(gClient, CFSTR("MidiRouterOut"), &gOutPort);
+        if (status != noErr) {
+            fprintf(stderr, "Error: MIDIOutputPortCreate failed (%d)\n", (int)status);
+            return 1;
+        }
     }
 
     // Create an input port for each rule
@@ -796,9 +818,12 @@ int main(int argc, char **argv) {
             if (ruleIdx < 0 || ruleIdx >= gNumRules) return;
             MidiRouteRule *rule = &gRules[ruleIdx];
 
-            for (int d = 0; d < rule->numDestPatterns; d++) {
-                if (rule->destEndpoints[d] != 0) {
-                    filterAndForwardPacketList(gOutPort, rule->destEndpoints[d], pktlist, rule->filterRealtime);
+            if (!gPassiveMonitor && gOutPort) {
+                for (int d = 0; d < rule->numDestPatterns; d++) {
+                    MIDIEndpointRef dst = atomic_load_explicit(&rule->destEndpoints[d], memory_order_acquire);
+                    if (dst != 0) {
+                        filterAndForwardPacketList(rule, d, gOutPort, dst, pktlist, rule->filterRealtime);
+                    }
                 }
             }
 
@@ -842,8 +867,9 @@ int main(int argc, char **argv) {
         CFRelease(timer);
     }
     for (int r = 0; r < gNumRules; r++) {
-        if (gRules[r].inPort && gRules[r].srcEndpoint) {
-            MIDIPortDisconnectSource(gRules[r].inPort, gRules[r].srcEndpoint);
+        MIDIEndpointRef src = atomic_load_explicit(&gRules[r].srcEndpoint, memory_order_relaxed);
+        if (gRules[r].inPort && src != 0) {
+            MIDIPortDisconnectSource(gRules[r].inPort, src);
         }
     }
     if (gClient) {
