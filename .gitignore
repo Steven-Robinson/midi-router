@@ -1,0 +1,4 @@
+midi-router
+*.o
+*.dSYM
+.DS_Store
